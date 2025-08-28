@@ -2,7 +2,6 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Server } from '@modelcontextprotocol/sdk/server';
 import { z } from 'zod';
 
-// --- Env var (sættes i Vercel: FIGMA_ACCESS_TOKEN=din_PAT) ---
 const FIGMA_TOKEN = process.env.FIGMA_ACCESS_TOKEN;
 
 function cors(res: VercelResponse) {
@@ -32,69 +31,103 @@ async function figma(path: string, params?: Record<string, string>) {
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   cors(res);
-
-  // Healthcheck & preflight
+  
+  // OPTIONS preflight
   if (req.method === 'OPTIONS') return res.status(200).end();
+  
+  // GET for SSE initialization (Claude MCP SSE transport)
   if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, server: 'figma-mcp', env: !!FIGMA_TOKEN });
+    // SSE headers for MCP transport
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Cache-Control');
+    
+    // Send initial SSE data for MCP capability discovery
+    res.write('data: {"jsonrpc":"2.0","method":"initialized","params":{}}\n\n');
+    
+    // Keep connection alive for MCP
+    const keepAlive = setInterval(() => {
+      res.write('data: {"jsonrpc":"2.0","method":"ping"}\n\n');
+    }, 30000);
+    
+    // Cleanup on close
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      res.end();
+    });
+    
+    return;
   }
+  
+  // POST for MCP JSON-RPC calls
+  if (req.method === 'POST') {
+    const server = new Server(
+      { name: 'figma-mcp', version: '0.1.0' },
+      { transport: { type: 'json' } }
+    );
 
-  // MCP server (HTTP/JSON envelopes til @modelcontextprotocol/server-fetch)
-  const server = new Server(
-    { name: 'figma-mcp', version: '0.1.0' },
-    { transport: { type: 'json' } }
-  );
+    // Tool 1: get-file
+    server.tool(
+      {
+        name: 'get-file',
+        description: 'Hent Figma file JSON',
+        inputSchema: z.object({
+          fileKey: z.string().describe('Figma file key (fra filens URL)')
+        })
+      },
+      async ({ fileKey }) => {
+        const data = await figma(`files/${fileKey}`);
+        return { content: [{ type: 'json', text: JSON.stringify(data, null, 2) }] };
+      }
+    );
 
-  // Tool 1: get-file
-  server.tool(
-    {
-      name: 'get-file',
-      description: 'Hent Figma file JSON',
-      inputSchema: z.object({
-        fileKey: z.string().describe('Figma file key (fra filens URL)')
-      })
-    },
-    async ({ fileKey }) => {
-      const data = await figma(`files/${fileKey}`);
-      return { content: [{ type: 'json', text: JSON.stringify(data) }] };
+    // Tool 2: export-node
+    server.tool(
+      {
+        name: 'export-node',
+        description: 'Eksportér en node som PNG/SVG via Figma images API',
+        inputSchema: z.object({
+          fileKey: z.string(),
+          nodeId: z.string(),
+          format: z.enum(['png', 'svg']).default('png'),
+          scale: z.number().min(0.1).max(4).default(1)
+        })
+      },
+      async ({ fileKey, nodeId, format, scale }) => {
+        const data = await figma(`images/${fileKey}`, {
+          ids: nodeId,
+          format,
+          scale: String(scale)
+        });
+        const url = data.images?.[nodeId];
+        if (!url) throw new Error('Ingen billed-URL retur fra Figma');
+        return { content: [{ type: 'text', text: url }] };
+      }
+    );
+
+    // Handle MCP JSON-RPC
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    if (!body) {
+      return res.status(400).json({ error: 'Missing JSON body' });
     }
-  );
 
-  // Tool 2: export-node (PNG/SVG via images endpoint)
-  server.tool(
-    {
-      name: 'export-node',
-      description: 'Eksportér en node som PNG/SVG via Figma images API',
-      inputSchema: z.object({
-        fileKey: z.string(),
-        nodeId: z.string(),
-        format: z.enum(['png', 'svg']).default('png'),
-        scale: z.number().min(0.1).max(4).default(1)
-      })
-    },
-    async ({ fileKey, nodeId, format, scale }) => {
-      const data = await figma(`images/${fileKey}`, {
-        ids: nodeId,
-        format,
-        scale: String(scale)
-      });
-      const url = data.images?.[nodeId];
-      if (!url) throw new Error('Ingen billed-URL retur fra Figma (tjek nodeId/fileKey)');
-      return { content: [{ type: 'text', text: url }] };
+    try {
+      const reply = await server.handleJSON(body);
+      res.setHeader('Content-Type', 'application/json');
+      return res.status(200).json(reply);
+    } catch (err: any) {
+      console.error('MCP handler error:', err);
+      return res.status(500).json({ error: String(err?.message || err) });
     }
-  );
+  }
 
-  // MCP envelope ind/ud
-  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-  if (!body) {
-    return res.status(400).json({ error: 'Missing JSON body (MCP envelope)' });
-  }
-  try {
-    const reply = await server.handleJSON(body);
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).send(JSON.stringify(reply));
-  } catch (err: any) {
-    console.error('MCP handler error:', err?.stack || err?.message || err);
-    return res.status(500).json({ error: String(err?.message || err) });
-  }
+  // Fallback health check
+  return res.status(200).json({ 
+    ok: true, 
+    server: 'figma-mcp', 
+    env: !!FIGMA_TOKEN,
+    methods: ['GET (SSE)', 'POST (JSON-RPC)']
+  });
 }
